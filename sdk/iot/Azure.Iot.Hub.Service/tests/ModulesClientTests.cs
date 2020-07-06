@@ -20,7 +20,7 @@ namespace Azure.Iot.Hub.Service.Tests
     /// </remarks>
     public class ModulesClientTests : E2eTestBase
     {
-        private const int BULK_DEVICE_COUNT = 10;
+        private const int BULK_MODULE_COUNT = 10;
         private readonly TimeSpan _queryMaxWaitTime = TimeSpan.FromSeconds(30);
         private readonly TimeSpan _queryRetryInterval = TimeSpan.FromSeconds(2);
 
@@ -406,6 +406,379 @@ namespace Azure.Iot.Hub.Service.Tests
                 }
 
                 await Cleanup(serviceClient, device);
+            }
+        }
+
+        /// <summary>
+        /// Test creating multiple modules on a single device
+        /// </summary>
+        [Test]
+        public async Task ModulesClient_BulkCreation_SingleDevice()
+        {
+            string testDevicePrefix = $"bulkDevice";
+            string testModulePrefix = $"bulkModule";
+
+            string deviceId = $"{testDevicePrefix}{GetRandom()}";
+            var deviceIdentity = new DeviceIdentity()
+            {
+                DeviceId = deviceId
+            };
+
+            IList<ModuleIdentity> moduleIdentities = BuildMultipleModules(deviceId, testModulePrefix, BULK_MODULE_COUNT);
+
+            IoTHubServiceClient client = GetClient();
+
+            try
+            {
+                // Create single device to house these bulk modules
+                await client.Devices.CreateOrUpdateIdentityAsync(deviceIdentity);
+
+                // Create modules in bulk on that device
+                Response<BulkRegistryOperationResponse> createResponse = await client.Modules.CreateIdentitiesAsync(moduleIdentities).ConfigureAwait(false);
+
+                Assert.IsTrue(createResponse.Value.IsSuccessful, "Bulk module creation ended with errors");
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentity);
+            }
+        }
+
+        /// <summary>
+        /// Test creating multiple modules on a multiple devices
+        /// </summary>
+        [Test]
+        public async Task ModulesClient_BulkCreation_MultipleDevices()
+        {
+            string testDevicePrefix = $"bulkDevice";
+            string testModulePrefix = $"bulkModule";
+
+            List<DeviceIdentity> deviceIdentities = new List<DeviceIdentity>();
+            List<ModuleIdentity> moduleIdentities = new List<ModuleIdentity>();
+            for (int moduleIndex = 0; moduleIndex < BULK_MODULE_COUNT; moduleIndex++)
+            {
+                string deviceId = $"{testDevicePrefix}{GetRandom()}";
+                deviceIdentities.Add(new DeviceIdentity()
+                {
+                    DeviceId = deviceId
+                });
+
+                moduleIdentities.Add(new ModuleIdentity()
+                {
+                    DeviceId = deviceId,
+                    ModuleId = $"{testModulePrefix}{GetRandom()}"
+                });
+            }
+
+            IoTHubServiceClient client = GetClient();
+
+            try
+            {
+                // Create devices to house these bulk modules
+                await client.Devices.CreateIdentitiesAsync(deviceIdentities);
+
+                // Create modules in bulk on those devices
+                Response<BulkRegistryOperationResponse> createResponse = await client.Modules.CreateIdentitiesAsync(moduleIdentities).ConfigureAwait(false);
+
+                Assert.IsTrue(createResponse.Value.IsSuccessful, "Bulk module creation ended with errors");
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentities);
+            }
+        }
+
+        /// <summary>
+        /// Creates a device to house some modules, creates two modules, and then uses the bulk update API to update
+        /// both of these modules.
+        /// </summary>
+        [Test]
+        public async Task ModulesClient_BulkUpdate()
+        {
+            string testDevicePrefix = $"bulkDeviceUpdate";
+            string testModulePrefix = $"bulkModuleUpdate";
+
+            IoTHubServiceClient client = GetClient();
+
+            string deviceId = $"{testDevicePrefix}{GetRandom()}";
+            var deviceIdentity = new DeviceIdentity()
+            {
+                DeviceId = deviceId
+            };
+
+            IList<ModuleIdentity> listOfModulesToUpdate = new List<ModuleIdentity>();
+
+            try
+            {
+                // Create the device to house two modules
+                await client.Devices.CreateOrUpdateIdentityAsync(deviceIdentity);
+
+                AuthenticationMechanismType initialAuthenticationType = AuthenticationMechanismType.Sas;
+                AuthenticationMechanismType updatedAuthenticationType = AuthenticationMechanismType.SelfSigned;
+
+                for (int moduleIndex = 0; moduleIndex < BULK_MODULE_COUNT; moduleIndex++)
+                {
+                    // Create modules on that device
+                    ModuleIdentity createdModule = (await client.Modules.CreateOrUpdateIdentityAsync(
+                        new ModuleIdentity
+                        {
+                            DeviceId = deviceId,
+                            ModuleId = $"{testModulePrefix}{GetRandom()}",
+                            Authentication = new AuthenticationMechanism()
+                            {
+                                Type = initialAuthenticationType
+                            },
+                        }).ConfigureAwait(false)).Value;
+
+                    // Update the authentication field so that we can test updating this identity later
+                    createdModule.Authentication = new AuthenticationMechanism()
+                    {
+                        Type = AuthenticationMechanismType.SelfSigned
+                    };
+
+                    listOfModulesToUpdate.Add(createdModule);
+                }
+
+                // Make the API call to update the modules.
+                Response<BulkRegistryOperationResponse> updateResponse =
+                    await client.Modules.UpdateIdentitiesAsync(listOfModulesToUpdate, BulkIfMatchPrecondition.Unconditional)
+                    .ConfigureAwait(false);
+
+                // TODO: (azabbasi) Once the issue with the error parsing is resolved, include the error message in the message of the assert statement.
+                Assert.IsTrue(updateResponse.Value.IsSuccessful, "Bulk module update ended with errors");
+
+                // Verify that each module successfully updated its authentication field
+                foreach (ModuleIdentity module in listOfModulesToUpdate)
+                {
+                    var updatedModule = (await client.Modules.GetIdentityAsync(module.DeviceId, module.ModuleId)).Value;
+                    updatedModule.Authentication.Type.Should().Be(updatedAuthenticationType, "Module should have been updated");
+                }
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentity);
+            }
+        }
+
+        /// <summary>
+        /// Test bulk module creation with an expected error.
+        /// All but one module are going to be brand new. One module already exists and we expect an error regarding that specific module.
+        /// </summary>
+        [Test]
+        [Ignore("DeviceRegistryOperationError cannot be parsed since service sends integer instead of a string")]
+        public async Task ModulesClient_BulkCreation_OneAlreadyExists()
+        {
+            string testDevicePrefix = $"bulkDeviceCreate";
+            string testModulePrefix = $"bulkModuleCreate";
+
+            IoTHubServiceClient client = GetClient();
+
+            string deviceId = $"{testDevicePrefix}{GetRandom()}";
+            var deviceIdentity = new DeviceIdentity()
+            {
+                DeviceId = deviceId
+            };
+
+            IList<ModuleIdentity> modules = BuildMultipleModules(deviceId, testModulePrefix, BULK_MODULE_COUNT - 1);
+
+            try
+            {
+                // We first create a single device to house these bulk modules.
+                await client.Devices.CreateOrUpdateIdentityAsync(deviceIdentity);
+
+                // Create a single module on that device that will be used to cause a conflict later
+                await client.Modules.CreateOrUpdateIdentityAsync(
+                    new ModuleIdentity()
+                    {
+                        DeviceId = deviceId,
+                        ModuleId = modules.ElementAt(0).ModuleId //Use the same module id as the first module in the bulk list
+                    }).ConfigureAwait(false);
+
+                // Create all devices
+                Response<BulkRegistryOperationResponse> createResponse = await client.Modules.CreateIdentitiesAsync(modules).ConfigureAwait(false);
+
+                // TODO: (azabbasi) Once the issue with the error parsing is resolved, include the error message in the message of the assert statement.
+                Assert.IsTrue(createResponse.Value.IsSuccessful, "Bulk device creation failed with errors");
+                createResponse.Value.Errors.Count.Should().Be(1);
+
+                // Since there is exactly one error, it is safe to just look at the first one here
+                var error = createResponse.Value.Errors.First();
+                error.ModuleId.Should().Be(modules.ElementAt(0).ModuleId, "Error should have been tied to the moduleId that was already created");
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentity);
+            }
+        }
+
+        [Test]
+        public async Task ModulesClient_BulkCreation_ModuleWithTwin()
+        {
+            string testDevicePrefix = $"bulkDeviceWithTwin";
+            string testModulePrefix = $"bulkModuleWithTwin";
+            string userPropertyName = "user";
+            string userPropertyValue = "userA";
+
+            IoTHubServiceClient client = GetClient();
+
+            string deviceId = $"{testDevicePrefix}{GetRandom()}";
+            DeviceIdentity deviceIdentity = new DeviceIdentity()
+            {
+                DeviceId = deviceId
+            };
+
+            IDictionary<string, object> desiredProperties = new Dictionary<string, object>
+            {
+                { userPropertyName, userPropertyValue }
+            };
+
+            // We will build a single device with multiple modules, and each module will have the same initial twin.
+            IDictionary<ModuleIdentity, TwinData> modulesAndTwins = BuildModulesAndTwins(deviceId, testModulePrefix, BULK_MODULE_COUNT, desiredProperties);
+
+            try
+            {
+                // Create device to house the modules
+                await client.Devices.CreateOrUpdateIdentityAsync(deviceIdentity).ConfigureAwait(false);
+
+                // Create the modules with an initial twin in bulk
+                Response<BulkRegistryOperationResponse> createResponse = await client.Modules.CreateIdentitiesWithTwinAsync(modulesAndTwins).ConfigureAwait(false);
+
+                // TODO: (azabbasi) Once the issue with the error parsing is resolved, include the error message in the message of the assert statement.
+                Assert.IsTrue(createResponse.Value.IsSuccessful, "Bulk module creation ended with errors");
+
+                // Verify that the desired properties were set
+                // For quicker test run, we will only verify the first device on the list.
+                Response<TwinData> getResponse = await client.Modules.GetTwinAsync(modulesAndTwins.Keys.First().DeviceId, modulesAndTwins.Keys.First().ModuleId).ConfigureAwait(false);
+                getResponse.Value.Properties.Desired[userPropertyName].Should().Be(userPropertyValue);
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentity);
+            }
+        }
+
+        /// <summary>
+        /// Test query by getting all twins.
+        /// For the purpose of this test, we will create a single device with multiple modules
+        /// and list all twins and verify the query returns everything expected.
+        /// </summary>
+        [Test]
+        public async Task ModulesClient_Query_GetTwins()
+        {
+            string testDevicePrefix = $"bulkDevice";
+            string testModulePrefix = $"bulkModule";
+
+            IoTHubServiceClient client = GetClient();
+
+            string deviceId = $"{testDevicePrefix}{GetRandom()}";
+            DeviceIdentity deviceIdentity = new DeviceIdentity()
+            {
+                DeviceId = deviceId
+            };
+
+            IList<ModuleIdentity> moduleIdentities = BuildMultipleModules(deviceId, testModulePrefix, BULK_MODULE_COUNT);
+
+            try
+            {
+                // Create the device to house all these modules
+                await client.Devices.CreateOrUpdateIdentityAsync(deviceIdentity).ConfigureAwait(false);
+
+                // Create the modules in bulk so they can be queried later
+                Response<BulkRegistryOperationResponse> createResponse = await client.Modules.CreateIdentitiesAsync(moduleIdentities).ConfigureAwait(false);
+
+                Assert.IsTrue(createResponse.Value.IsSuccessful, "Bulk module creation ended with errors");
+
+                // We will retry the operation since it can take some time for the query to match what was recently created.
+                int matchesFound = 0;
+                DateTimeOffset startTime = DateTime.UtcNow;
+
+                while (DateTime.UtcNow - startTime < _queryMaxWaitTime)
+                {
+                    matchesFound = 0;
+                    AsyncPageable<TwinData> twins = client.Modules.GetTwinsAsync();
+
+                    // We will verify we have twins for all recently created devices.
+                    await foreach (TwinData twin in twins)
+                    {
+                        if (moduleIdentities.Any(d => d.DeviceId.Equals(twin.DeviceId, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            matchesFound++;
+                        }
+                    }
+
+                    if (matchesFound == BULK_MODULE_COUNT)
+                    {
+                        break;
+                    }
+
+                    await Task.Delay(_queryRetryInterval);
+                }
+
+                matchesFound.Should().Be(BULK_MODULE_COUNT, "Timed out waiting for all the bulk created modules to be query-able." +
+                    " Number of matching modules must be equal to the number of recently created modules.");
+            }
+            finally
+            {
+                await Cleanup(client, deviceIdentity);
+            }
+        }
+
+        private IDictionary<ModuleIdentity, TwinData> BuildModulesAndTwins(string deviceId, string testModulePrefix, int deviceCount, IDictionary<string, object> desiredProperties)
+        {
+            IList<ModuleIdentity> modules = BuildMultipleModules(deviceId, testModulePrefix, deviceCount);
+            IDictionary<ModuleIdentity, TwinData> modulesAndTwins = new Dictionary<ModuleIdentity, TwinData>();
+
+            foreach (ModuleIdentity module in modules)
+            {
+                modulesAndTwins.Add(module, new TwinData { Properties = new TwinProperties { Desired = desiredProperties } });
+            }
+
+            return modulesAndTwins;
+        }
+
+        private IList<DeviceIdentity> BuildMultipleDevices(string testDevicePrefix, int deviceCount)
+        {
+            List<DeviceIdentity> deviceList = new List<DeviceIdentity>();
+
+            for (int i = 0; i < deviceCount; i++)
+            {
+                deviceList.Add(new DeviceIdentity { DeviceId = $"{testDevicePrefix}{GetRandom()}" });
+            }
+
+            return deviceList;
+        }
+
+        /// <summary>
+        /// Builds a list of module identities that all belong to the provided device
+        /// </summary>
+        private IList<ModuleIdentity> BuildMultipleModules(string deviceId, string testModulePrefix, int deviceCount)
+        {
+            List<ModuleIdentity> moduleList = new List<ModuleIdentity>();
+
+            for (int i = 0; i < deviceCount; i++)
+            {
+                moduleList.Add(new ModuleIdentity
+                {
+                    DeviceId = deviceId,
+                    ModuleId = $"{testModulePrefix}{GetRandom()}"
+                });
+            }
+
+            return moduleList;
+        }
+
+        private async Task Cleanup(IoTHubServiceClient client, IEnumerable<DeviceIdentity> devices)
+        {
+            try
+            {
+                if (devices != null && devices.Any())
+                {
+                    await client.Devices.DeleteIdentitiesAsync(devices, BulkIfMatchPrecondition.Unconditional);
+                }
+            }
+            catch (Exception ex)
+            {
+                Assert.Fail($"Test clean up failed: {ex.Message}");
             }
         }
 
